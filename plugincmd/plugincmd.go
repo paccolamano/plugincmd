@@ -95,6 +95,11 @@ func ensureCollection(app core.App) error {
 			Name:     "version",
 			Required: true,
 		},
+		&core.AutodateField{
+			Name:     "installed",
+			OnCreate: true,
+			OnUpdate: false,
+		},
 	)
 
 	return app.Save(pluginCollection)
