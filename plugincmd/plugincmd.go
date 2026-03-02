@@ -17,14 +17,12 @@ import (
 	"github.com/paccolamano/plugin/plugincmd/internal/util"
 
 	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/tools/filesystem"
 	"github.com/pocketbase/pocketbase/tools/security"
 	"github.com/spf13/cobra"
 )
 
-const (
-	pluginCollectionName = "_plugins"
-	defaultPluginFolder  = "pb_plugins"
-)
+const pluginCollectionName = "_plugins"
 
 var (
 	ErrAlreadyInstalled = errors.New("already installed")
@@ -32,7 +30,6 @@ var (
 )
 
 type Config struct {
-	Dir         string
 	Autorestart bool
 }
 
@@ -43,13 +40,22 @@ func MustRegister(app core.App, rootCmd *cobra.Command, config Config) {
 }
 
 func Register(app core.App, rootCmd *cobra.Command, config Config) error {
-	if config.Dir == "" {
-		config.Dir = filepath.Join(app.DataDir(), "..", defaultPluginFolder)
-	}
-
 	pm := &pluginCmd{app: app, config: config}
 
-	app.OnBootstrap().BindFunc(func(e *core.BootstrapEvent) error {
+	pm.app.OnBackupRestore().BindFunc(func(e *core.BackupEvent) error {
+		if err := e.Next(); err != nil {
+			return err
+		}
+		pm.maybeRestart()
+		return nil
+	})
+
+	pm.app.OnRecordAfterDeleteSuccess(pluginCollectionName).BindFunc(func(e *core.RecordEvent) error {
+		pm.maybeRestart()
+		return e.Next()
+	})
+
+	pm.app.OnBootstrap().BindFunc(func(e *core.BootstrapEvent) error {
 		if err := e.Next(); err != nil {
 			return err
 		}
@@ -58,13 +64,13 @@ func Register(app core.App, rootCmd *cobra.Command, config Config) error {
 		}
 
 		if pm.config.Autorestart && util.IsServeProcess() {
-			if err := os.MkdirAll(pm.config.Dir, 0o755); err == nil {
-				_ = os.WriteFile(util.PidFilePath(pm.config.Dir), []byte(strconv.Itoa(os.Getpid())), 0o644)
+			if err := os.WriteFile(util.PidFilePath(e.App.DataDir()), []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+				return err
 			}
 			util.SetupRestartSignal()
 		}
 
-		return loadAll(e.App, pm.config.Dir)
+		return loadAll(e.App)
 	})
 
 	if rootCmd != nil {
@@ -80,16 +86,17 @@ func ensureCollection(app core.App) error {
 	}
 
 	pluginCollection := core.NewBaseCollection(pluginCollectionName)
-	pluginCollection.System = true
 
 	pluginCollection.Fields.Add(
 		&core.TextField{
 			Name:     "pluginUri",
 			Required: true,
 		},
-		&core.TextField{
-			Name:     "buildFile",
-			Required: true,
+		&core.FileField{
+			Name:      "buildFile",
+			Required:  true,
+			Protected: true,
+			MaxSize:   1<<53 - 1,
 		},
 		&core.TextField{
 			Name:     "version",
@@ -105,7 +112,7 @@ func ensureCollection(app core.App) error {
 	return app.Save(pluginCollection)
 }
 
-func loadAll(app core.App, dir string) error {
+func loadAll(app core.App) error {
 	records, err := app.FindAllRecords(pluginCollectionName)
 	if err != nil {
 		return nil // collection does not exist yet
@@ -113,7 +120,8 @@ func loadAll(app core.App, dir string) error {
 
 	for _, record := range records {
 		uri := record.GetString("pluginUri")
-		soPath := filepath.Join(dir, record.GetString("buildFile"))
+		filename := record.GetString("buildFile")
+		soPath := filepath.Join(app.DataDir(), core.LocalStorageDirName, record.BaseFilesPath(), filename)
 
 		p, err := plugin.Open(soPath)
 		if err != nil {
@@ -210,7 +218,7 @@ func (pm *pluginCmd) install(ctx context.Context, target, version, provider, tok
 	return fmt.Errorf("invalid target %q: expected owner/repo, https://..., or a local path (./...)", target)
 }
 
-func (pm *pluginCmd) installFromURL(ctx context.Context, repoURL, version, provider, token string) (err error) {
+func (pm *pluginCmd) installFromURL(ctx context.Context, repoURL, version, provider, token string) error {
 	u, err := url.Parse(repoURL)
 	if err != nil {
 		return fmt.Errorf("invalid URL %q: %w", repoURL, err)
@@ -258,21 +266,17 @@ func (pm *pluginCmd) installFromURL(ctx context.Context, repoURL, version, provi
 		return err
 	}
 
-	if err := os.MkdirAll(pm.config.Dir, 0o755); err != nil {
-		return fmt.Errorf("failed to create plugins directory: %w", err)
-	}
-
 	soName := fmt.Sprintf("%s_%s_%s_%s.so", security.RandomString(10), repoName, runtime.GOOS, runtime.GOARCH)
-	destPath := filepath.Join(pm.config.Dir, soName)
-	defer func() {
-		if err != nil {
-			os.Remove(destPath)
-		}
-	}()
+	destPath := filepath.Join(tmpDir, soName)
 
 	fmt.Printf("Compiling %s...\n", repoURL)
 	if err := util.CompilePlugin(srcDir, destPath); err != nil {
 		return err
+	}
+
+	f, err := filesystem.NewFileFromPath(destPath)
+	if err != nil {
+		return fmt.Errorf("failed to prepare plugin file: %w", err)
 	}
 
 	pluginCollection, err := pm.app.FindCollectionByNameOrId(pluginCollectionName)
@@ -282,7 +286,7 @@ func (pm *pluginCmd) installFromURL(ctx context.Context, repoURL, version, provi
 
 	record := core.NewRecord(pluginCollection)
 	record.Set("pluginUri", repoURL)
-	record.Set("buildFile", soName)
+	record.Set("buildFile", f)
 	record.Set("version", release.TagName)
 
 	if err := pm.app.Save(record); err != nil {
@@ -294,7 +298,7 @@ func (pm *pluginCmd) installFromURL(ctx context.Context, repoURL, version, provi
 	return nil
 }
 
-func (pm *pluginCmd) installLocal(localPath string) (err error) {
+func (pm *pluginCmd) installLocal(localPath string) error {
 	absPath, err := filepath.Abs(localPath)
 	if err != nil {
 		return fmt.Errorf("failed to resolve path: %w", err)
@@ -306,21 +310,23 @@ func (pm *pluginCmd) installLocal(localPath string) (err error) {
 		return fmt.Errorf("plugin from %q is already installed (version %s): %w", absPath, existing.GetString("version"), ErrAlreadyInstalled)
 	}
 
-	if err := os.MkdirAll(pm.config.Dir, 0o755); err != nil {
-		return fmt.Errorf("failed to create plugins directory: %w", err)
-	}
-
 	soName := fmt.Sprintf("%s_%s_%s_%s.so", security.RandomString(10), filepath.Base(absPath), runtime.GOOS, runtime.GOARCH)
-	destPath := filepath.Join(pm.config.Dir, soName)
-	defer func() {
-		if err != nil {
-			os.Remove(destPath)
-		}
-	}()
+	tmpDir, err := os.MkdirTemp("", "pbplugin-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp directory: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	destPath := filepath.Join(tmpDir, soName)
 
 	fmt.Printf("Compiling %s...\n", absPath)
 	if err := util.CompilePlugin(absPath, destPath); err != nil {
 		return err
+	}
+
+	f, err := filesystem.NewFileFromPath(destPath)
+	if err != nil {
+		return fmt.Errorf("failed to prepare plugin file: %w", err)
 	}
 
 	pluginCollection, err := pm.app.FindCollectionByNameOrId(pluginCollectionName)
@@ -330,7 +336,7 @@ func (pm *pluginCmd) installLocal(localPath string) (err error) {
 
 	record := core.NewRecord(pluginCollection)
 	record.Set("pluginUri", uri)
-	record.Set("buildFile", soName)
+	record.Set("buildFile", f)
 	record.Set("version", "unknown")
 
 	if err := pm.app.Save(record); err != nil {
@@ -362,11 +368,6 @@ func (pm *pluginCmd) remove(target string) error {
 	record, err := pm.findByURI(target)
 	if err != nil {
 		return fmt.Errorf("plugin %q is not installed: %w", target, ErrNotInstalled)
-	}
-
-	soPath := filepath.Join(pm.config.Dir, record.GetString("buildFile"))
-	if err := os.Remove(soPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to remove plugin file: %w", err)
 	}
 
 	if err := pm.app.Delete(record); err != nil {
@@ -433,7 +434,7 @@ func (pm *pluginCmd) list() error {
 func (pm *pluginCmd) maybeRestart() {
 	if pm.config.Autorestart {
 		fmt.Println("Signaling server to restart...")
-		if err := util.SignalServe(pm.config.Dir); err != nil {
+		if err := util.SignalServe(pm.app.DataDir()); err != nil {
 			fmt.Printf("Warning: %v\nPlease restart the server manually.\n", err)
 		}
 	}
